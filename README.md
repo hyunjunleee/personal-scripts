@@ -10,7 +10,7 @@ Collection of automation scripts from my personal projects
 | :--- | :--- | :--- | :--- |
 | **[wsl-scripts](./wsl-scripts/)** | `Bash`, `Linux`, `WSL` | 리눅스와 윈도우 간의 파일/권한 연동, 디스플레이 서버(Wayland/X11) 트러블슈팅을 위한 시스템 유틸리티 | 2026 |
 | **[windows-tools](./windows-tools/)** | `batch` `C++` |  | 2020 |
-| **[vba-macros](./vba-macros/)** | `VBA` |  | 2018 |
+| **[vba-macros](./vba-macros/)** | `VBA` | 엑셀 | 2019 |
 
 ---
 
