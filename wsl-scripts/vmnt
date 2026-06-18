@@ -1,0 +1,712 @@
+#!/usr/bin/env bash
+
+# ==============================================================================
+# Script Name: vmnt (WSL VHD & EXT4 Image Mount Manager)
+# Description: WSL 환경에서 Windows VHDX 및 원시 이미지(ext4, img)를 
+#              크로스 플랫폼으로 손쉽게 마운트/언마운트하는 유틸리티
+# Author: Hyunjun Lee
+# Dependencies: iconv, base64, findmnt
+# ==============================================================================
+
+
+set -Eeuo pipefail
+
+
+# ==========================================
+# 사용자 설정
+# ==========================================
+DEFAULT_BASE_DIR="D"
+WAIT_SECONDS=20
+
+# ==========================================
+# 출력/오류 유틸리티
+# ==========================================
+die() {
+    echo "❌ $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "⚠️  $*" >&2
+}
+
+ok() {
+    echo "✅ $*"
+}
+
+info() {
+    echo "🔄 $*"
+}
+
+# ==========================================
+# 도움말
+# ==========================================
+show_help() {
+    cat <<'EOF'
+WSL VHD & EXT4 Image Mount Manager (vmnt)
+
+Usage:
+  vmnt [flags] <name>
+
+Flags:
+  -m, --mount             [기본값] VHDX/image 마운트 및 현재 폴더에 링크 생성
+  -i, --image             대상이 VHDX가 아닌 원시 이미지(ext4, img) 파일일 때 사용
+  -u, --unmount           마운트 해제 및 현재 폴더의 링크 삭제
+  -l, --list              현재 /mnt/wsl 아래 마운트 목록 확인
+  -r, --readonly          image 모드에서 읽기 전용으로 마운트
+  -d, --dir <path>        VHDX/ext4/img 파일을 찾을 기본 디렉터리 지정
+      --base-dir <path>   --dir과 동일
+      --no-link           현재 폴더에 심볼릭 링크를 만들거나 삭제하지 않음
+  -h, --help              도움말 출력
+
+Default:
+  기본 검색 위치는 D 드라이브입니다.
+
+Examples:
+  vmnt snu
+      -> D:\snu.vhdx 를 VHD 모드로 마운트
+
+  vmnt -i snu
+      -> /mnt/d/snu.ext4 또는 /mnt/d/snu.img 를 image 모드로 마운트
+
+  vmnt -d E snu
+      -> E:\snu.vhdx 를 VHD 모드로 마운트
+
+  vmnt -d 'E:\WSL Images' snu
+      -> E:\WSL Images\snu.vhdx 를 VHD 모드로 마운트
+
+  vmnt -i -d /mnt/e/images snu
+      -> /mnt/e/images/snu.ext4 또는 /mnt/e/images/snu.img 를 image 모드로 마운트
+
+  vmnt -i -r -d /mnt/e/images snu
+      -> image 모드로 읽기 전용 마운트
+
+  vmnt data.vhdx
+      -> data 라는 이름으로 D:\data.vhdx 를 VHD 모드로 마운트
+
+  vmnt data.img
+      -> data 라는 이름으로 /mnt/d/data.img 를 image 모드로 마운트
+
+Notes:
+  VHD 모드의 읽기 전용 마운트는 이 스크립트에서 지원하지 않습니다.
+  안전한 읽기 전용 마운트가 필요하면 image 모드(-i -r)를 사용하세요.
+EOF
+}
+
+# ==========================================
+# 경로 유틸리티
+# ==========================================
+to_slashes() {
+    printf '%s' "$1" | tr '\\' '/'
+}
+
+to_backslashes() {
+    printf '%s' "$1" | tr '/' '\\'
+}
+
+ensure_trailing_slash() {
+    local p="$1"
+
+    if [[ "$p" == "/" ]]; then
+        printf '/'
+        return 0
+    fi
+
+    p="${p%/}"
+    printf '%s/' "$p"
+}
+
+ensure_trailing_backslash() {
+    local p="$1"
+
+    p="${p%\\}"
+    printf '%s\\' "$p"
+}
+
+abs_wsl_path() {
+    local p="$1"
+
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m "$p"
+    else
+        if [[ "$p" == /* ]]; then
+            printf '%s\n' "$p"
+        else
+            printf '%s/%s\n' "$PWD" "$p"
+        fi
+    fi
+}
+
+wsl_base_from_input() {
+    local p="$1"
+    local drive
+    local rest
+    local abs
+
+    # D
+    if [[ "$p" =~ ^[A-Za-z]$ ]]; then
+        drive="${p,,}"
+        printf '/mnt/%s/\n' "$drive"
+        return 0
+    fi
+
+    # D:, D:\path, D:/path
+    if [[ "$p" =~ ^([A-Za-z]):[\\/]?(.*)$ ]]; then
+        drive="${BASH_REMATCH[1],,}"
+        rest="$(to_slashes "${BASH_REMATCH[2]}")"
+        rest="${rest#/}"
+        rest="${rest%/}"
+
+        if [[ -n "$rest" ]]; then
+            printf '/mnt/%s/%s/\n' "$drive" "$rest"
+        else
+            printf '/mnt/%s/\n' "$drive"
+        fi
+
+        return 0
+    fi
+
+    # /mnt/d/path
+    if [[ "$p" =~ ^/mnt/([A-Za-z])/?(.*)$ ]]; then
+        drive="${BASH_REMATCH[1],,}"
+        rest="$(to_slashes "${BASH_REMATCH[2]}")"
+        rest="${rest#/}"
+        rest="${rest%/}"
+
+        if [[ -n "$rest" ]]; then
+            printf '/mnt/%s/%s/\n' "$drive" "$rest"
+        else
+            printf '/mnt/%s/\n' "$drive"
+        fi
+
+        return 0
+    fi
+
+    # 일반 Linux 절대 경로
+    if [[ "$p" == /* ]]; then
+        ensure_trailing_slash "$p"
+        printf '\n'
+        return 0
+    fi
+
+    # 일반 Linux 상대 경로
+    abs="$(abs_wsl_path "$p")"
+    ensure_trailing_slash "$abs"
+    printf '\n'
+}
+
+win_base_from_input() {
+    local p="$1"
+    local drive
+    local rest
+    local abs
+
+    # D
+    if [[ "$p" =~ ^[A-Za-z]$ ]]; then
+        drive="${p^^}"
+        printf '%s:\\\n' "$drive"
+        return 0
+    fi
+
+    # D:, D:\path, D:/path
+    if [[ "$p" =~ ^([A-Za-z]):[\\/]?(.*)$ ]]; then
+        drive="${BASH_REMATCH[1]^^}"
+        rest="$(to_backslashes "${BASH_REMATCH[2]}")"
+        rest="${rest#\\}"
+        rest="${rest%\\}"
+
+        if [[ -n "$rest" ]]; then
+            printf '%s:\\%s\\\n' "$drive" "$rest"
+        else
+            printf '%s:\\\n' "$drive"
+        fi
+
+        return 0
+    fi
+
+    # /mnt/d/path
+    if [[ "$p" =~ ^/mnt/([A-Za-z])/?(.*)$ ]]; then
+        drive="${BASH_REMATCH[1]^^}"
+        rest="$(to_backslashes "${BASH_REMATCH[2]}")"
+        rest="${rest#\\}"
+        rest="${rest%\\}"
+
+        if [[ -n "$rest" ]]; then
+            printf '%s:\\%s\\\n' "$drive" "$rest"
+        else
+            printf '%s:\\\n' "$drive"
+        fi
+
+        return 0
+    fi
+
+    # 상대 경로가 /mnt/<drive> 아래라면 Windows 경로로 변환
+    if [[ "$p" != /* ]]; then
+        abs="$(abs_wsl_path "$p")"
+
+        if [[ "$abs" =~ ^/mnt/([A-Za-z])/?(.*)$ ]]; then
+            drive="${BASH_REMATCH[1]^^}"
+            rest="$(to_backslashes "${BASH_REMATCH[2]}")"
+            rest="${rest#\\}"
+            rest="${rest%\\}"
+
+            if [[ -n "$rest" ]]; then
+                printf '%s:\\%s\\\n' "$drive" "$rest"
+            else
+                printf '%s:\\\n' "$drive"
+            fi
+
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+resolve_base_dirs() {
+    WSL_BASE_DIR="$(wsl_base_from_input "$BASE_DIR_INPUT")"
+
+    if WIN_BASE_DIR="$(win_base_from_input "$BASE_DIR_INPUT")"; then
+        :
+    else
+        WIN_BASE_DIR=""
+    fi
+}
+
+normalize_name_and_mode() {
+    local lower="${VHD_NAME,,}"
+
+    case "$lower" in
+        *.vhdx)
+            if [[ "$FILE_TYPE" == "image" ]]; then
+                die "'.vhdx' 파일명은 image 모드(-i)와 함께 사용할 수 없습니다."
+            fi
+            VHD_NAME="${VHD_NAME%.*}"
+            ;;
+        *.ext4|*.img)
+            FILE_TYPE="image"
+            VHD_NAME="${VHD_NAME%.*}"
+            ;;
+    esac
+
+    [[ -n "$VHD_NAME" ]] || die "디스크 이름이 비어 있습니다."
+}
+
+# ==========================================
+# PowerShell 유틸리티
+# ==========================================
+ps_sq() {
+    local s="$1"
+
+    s=${s//\'/\'\'}
+    printf "'%s'" "$s"
+}
+
+ps_b64() {
+    command -v iconv >/dev/null 2>&1 || die "iconv 명령을 찾을 수 없습니다."
+    command -v base64 >/dev/null 2>&1 || die "base64 명령을 찾을 수 없습니다."
+
+    printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n'
+}
+
+find_powershell_for_bash() {
+    local fallback
+
+    if command -v powershell.exe >/dev/null 2>&1; then
+        command -v powershell.exe
+        return 0
+    fi
+
+    fallback="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    [[ -x "$fallback" ]] || die "powershell.exe를 찾을 수 없습니다. WSL 환경인지 확인하세요."
+
+    printf '%s\n' "$fallback"
+}
+
+run_elevated_ps() {
+    local ps_script="$1"
+    local encoded
+    local ps_exec
+    local launcher
+
+    ps_exec="$(find_powershell_for_bash)"
+    encoded="$(ps_b64 "$ps_script")"
+
+    launcher="$(cat <<EOF
+\$p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-WindowStyle', 'Hidden',
+    '-EncodedCommand', '$encoded'
+)
+
+if (\$null -ne \$p.ExitCode) {
+    exit \$p.ExitCode
+}
+
+exit 0
+EOF
+)"
+
+    "$ps_exec" -NoProfile -ExecutionPolicy Bypass -Command "$launcher"
+}
+
+vhd_exists_windows() {
+    local win_vhd_path="$1"
+    local ps_exec
+
+    ps_exec="$(find_powershell_for_bash)"
+
+    "$ps_exec" -NoProfile -ExecutionPolicy Bypass -Command \
+        "if (Test-Path -LiteralPath $(ps_sq "$win_vhd_path")) { exit 0 } else { exit 1 }"
+}
+
+# ==========================================
+# 마운트 상태 확인
+# ==========================================
+is_mounted() {
+    [[ -n "${WSL_MOUNT_POINT:-}" ]] || return 1
+
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -rn --mountpoint "$WSL_MOUNT_POINT" >/dev/null 2>&1
+        return $?
+    fi
+
+    awk -v p="$WSL_MOUNT_POINT" '$2 == p { found = 1 } END { exit !found }' /proc/mounts
+}
+
+wait_for_mount() {
+    local i
+
+    for ((i = 1; i <= WAIT_SECONDS; i++)); do
+        if is_mounted; then
+            echo
+            return 0
+        fi
+
+        echo -n "."
+        sleep 1
+    done
+
+    echo
+    return 1
+}
+
+wait_for_unmount() {
+    local i
+
+    for ((i = 1; i <= WAIT_SECONDS; i++)); do
+        if ! is_mounted; then
+            return 0
+        fi
+
+        sleep 1
+    done
+
+    return 1
+}
+
+# ==========================================
+# 이미지 파일 탐색
+# ==========================================
+find_image_file() {
+    local ext
+    local candidate
+
+    for ext in ext4 img; do
+        candidate="${WSL_BASE_DIR}${VHD_NAME}.${ext}"
+
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ==========================================
+# 심볼릭 링크 관리
+# ==========================================
+ensure_link() {
+    [[ "$CREATE_LINK" == "true" ]] || return 0
+
+    if [[ -L "$LINK_PATH" ]]; then
+        local current
+
+        current="$(readlink "$LINK_PATH" || true)"
+
+        if [[ "$current" == "$WSL_MOUNT_POINT" ]]; then
+            ok "링크가 이미 존재합니다: $LINK_PATH -> $WSL_MOUNT_POINT"
+            return 0
+        fi
+
+        warn "기존 심볼릭 링크를 교체합니다: $LINK_PATH -> $current"
+        rm "$LINK_PATH"
+    fi
+
+    if [[ -e "$LINK_PATH" ]]; then
+        warn "현재 폴더에 이미 '$VHD_NAME' 파일/폴더가 있어 링크를 생성하지 않았습니다."
+        return 0
+    fi
+
+    ln -s "$WSL_MOUNT_POINT" "$LINK_PATH"
+    ok "현재 폴더에 링크가 생성되었습니다: $LINK_PATH -> $WSL_MOUNT_POINT"
+}
+
+remove_link() {
+    [[ "$CREATE_LINK" == "true" ]] || return 0
+
+    if [[ -L "$LINK_PATH" ]]; then
+        rm "$LINK_PATH"
+        ok "현재 폴더의 링크를 삭제했습니다: $LINK_PATH"
+    fi
+}
+
+# ==========================================
+# VHDX 마운트/언마운트
+# ==========================================
+mount_vhd() {
+    local win_vhd_path
+    local ps_cmd
+
+    [[ -n "$WIN_BASE_DIR" ]] || die "VHD 모드에서는 Windows 드라이브 경로가 필요합니다. 예: -d D 또는 -d 'E:\images'"
+
+    if [[ "$READ_ONLY" == "true" ]]; then
+        die "VHD 모드의 --readonly는 이 스크립트에서 지원하지 않습니다. image 모드(-i)에서만 사용하세요."
+    fi
+
+    win_vhd_path="${WIN_BASE_DIR}${VHD_NAME}.vhdx"
+
+    if ! vhd_exists_windows "$win_vhd_path"; then
+        die "VHDX 파일을 찾을 수 없습니다: $win_vhd_path"
+    fi
+
+    info "[VHD 모드] Windows 관리자 권한(UAC)을 요청합니다..."
+    echo "📁 대상 파일: $win_vhd_path"
+
+    ps_cmd="wsl.exe --mount --vhd $(ps_sq "$win_vhd_path") --name $(ps_sq "$VHD_NAME"); exit \$LASTEXITCODE"
+
+    run_elevated_ps "$ps_cmd" || die "VHD 마운트 명령 실행에 실패했습니다."
+
+    echo -n "⏳ 마운트 확인 중"
+
+    if wait_for_mount; then
+        ok "마운트 성공: $WSL_MOUNT_POINT"
+    else
+        die "마운트 확인 실패: $WSL_MOUNT_POINT
+
+확인할 것:
+  1. Windows 11 또는 Microsoft Store 버전 WSL인지
+  2. 현재 WSL이 --name 옵션을 지원하는지
+  3. VHDX 파일이 이미 다른 WSL 배포판이나 프로세스에서 사용 중인지
+  4. Windows 관리자 권한 승인을 완료했는지
+  5. 경로가 실제로 존재하는지: $win_vhd_path"
+    fi
+}
+
+unmount_vhd() {
+    local win_vhd_path
+    local ps_cmd
+
+    [[ -n "$WIN_BASE_DIR" ]] || die "VHD 모드에서는 Windows 드라이브 경로가 필요합니다. 예: -d D 또는 -d 'E:\images'"
+
+    win_vhd_path="${WIN_BASE_DIR}${VHD_NAME}.vhdx"
+
+    info "[VHD 모드] Windows 관리자 권한(UAC)을 요청합니다..."
+    echo "📁 대상 파일: $win_vhd_path"
+
+    ps_cmd="wsl.exe --unmount $(ps_sq "$win_vhd_path"); exit \$LASTEXITCODE"
+
+    run_elevated_ps "$ps_cmd" || die "VHD 언마운트 명령 실행에 실패했습니다."
+
+    if wait_for_unmount; then
+        ok "VHD 언마운트 완료: $VHD_NAME"
+        rmdir "$WSL_MOUNT_POINT" 2>/dev/null || true
+    else
+        warn "언마운트 명령은 전송됐지만 아직 마운트가 남아 있습니다."
+        warn "마운트할 때와 다른 -d 경로를 사용했는지 확인하세요."
+        warn "사용 중인 터미널/프로세스를 닫거나 필요 시 Windows에서 'wsl --shutdown'을 실행하세요."
+    fi
+}
+
+# ==========================================
+# Raw 이미지 마운트/언마운트
+# ==========================================
+mount_image() {
+    local target_file
+    local mount_options="loop"
+
+    target_file="$(find_image_file)" \
+        || die "${WSL_BASE_DIR} 에서 ${VHD_NAME}.ext4 또는 ${VHD_NAME}.img 파일을 찾을 수 없습니다."
+
+    if [[ "$READ_ONLY" == "true" ]]; then
+        mount_options="loop,ro"
+    fi
+
+    info "[이미지 모드] $target_file 파일을 Linux 내부로 마운트합니다..."
+    echo "📁 검색 경로: $WSL_BASE_DIR"
+    echo "🔑 Linux sudo 권한이 필요할 수 있습니다."
+
+    sudo mkdir -p "$WSL_MOUNT_POINT"
+
+    if ! sudo mount -o "$mount_options" "$target_file" "$WSL_MOUNT_POINT"; then
+        sudo rmdir "$WSL_MOUNT_POINT" 2>/dev/null || true
+        die "이미지 마운트 실패: $target_file"
+    fi
+
+    if is_mounted; then
+        ok "마운트 성공: $WSL_MOUNT_POINT"
+    else
+        die "mount 명령은 완료됐지만 마운트 상태를 확인하지 못했습니다."
+    fi
+}
+
+unmount_image() {
+    echo "🔑 Linux sudo 권한이 필요할 수 있습니다."
+
+    if is_mounted; then
+        sudo umount "$WSL_MOUNT_POINT" \
+            || die "언마운트 실패: 사용 중인 파일/터미널이 있는지 확인하세요."
+
+        ok "이미지 마운트 해제 완료: $WSL_MOUNT_POINT"
+    else
+        warn "이미 마운트되어 있지 않습니다: $WSL_MOUNT_POINT"
+    fi
+
+    sudo rmdir "$WSL_MOUNT_POINT" 2>/dev/null || true
+}
+
+# ==========================================
+# 목록 출력
+# ==========================================
+list_mounts() {
+    echo "📊 현재 /mnt/wsl 아래 마운트 상태:"
+
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -R /mnt/wsl 2>/dev/null || echo "마운트된 디스크가 없습니다."
+    else
+        df -h | grep "/mnt/wsl/" || echo "마운트된 디스크가 없습니다."
+    fi
+}
+
+# ==========================================
+# 인자 파싱
+# ==========================================
+ACTION="mount"
+FILE_TYPE="vhd"
+READ_ONLY="false"
+CREATE_LINK="true"
+VHD_NAME=""
+BASE_DIR_INPUT="$DEFAULT_BASE_DIR"
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -m|--mount)
+            ACTION="mount"
+            shift
+            ;;
+        -u|--unmount)
+            ACTION="unmount"
+            shift
+            ;;
+        -l|--list)
+            ACTION="list"
+            shift
+            ;;
+        -i|--image)
+            FILE_TYPE="image"
+            shift
+            ;;
+        -r|--readonly)
+            READ_ONLY="true"
+            shift
+            ;;
+        --no-link)
+            CREATE_LINK="false"
+            shift
+            ;;
+        -d|--dir|--base-dir)
+            opt="$1"
+            shift
+
+            [[ "$#" -gt 0 ]] || die "$opt 옵션에는 경로가 필요합니다."
+
+            BASE_DIR_INPUT="$1"
+            shift
+            ;;
+        --dir=*|--base-dir=*)
+            BASE_DIR_INPUT="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -*)
+            die "알 수 없는 옵션: $1"
+            ;;
+        *)
+            if [[ -n "$VHD_NAME" ]]; then
+                die "디스크 이름은 하나만 입력할 수 있습니다: '$VHD_NAME' '$1'"
+            fi
+
+            VHD_NAME="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ "$ACTION" == "list" ]]; then
+    list_mounts
+    exit 0
+fi
+
+[[ -n "$VHD_NAME" ]] || {
+    show_help
+    die "디스크 이름을 입력해야 합니다."
+}
+
+normalize_name_and_mode
+
+if [[ ! "$VHD_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "디스크 이름에는 영문자, 숫자, 점(.), 밑줄(_), 하이픈(-)만 허용합니다: $VHD_NAME"
+fi
+
+resolve_base_dirs
+
+WSL_MOUNT_POINT="/mnt/wsl/${VHD_NAME}"
+LINK_PATH="./${VHD_NAME}"
+
+# ==========================================
+# 실행
+# ==========================================
+case "$ACTION" in
+    mount)
+        if is_mounted; then
+            warn "이미 '$VHD_NAME' 디스크가 마운트되어 있습니다: $WSL_MOUNT_POINT"
+        else
+            if [[ "$FILE_TYPE" == "vhd" ]]; then
+                mount_vhd
+            else
+                mount_image
+            fi
+        fi
+
+        ensure_link
+        ;;
+    unmount)
+        info "'$VHD_NAME' 마운트를 해제합니다..."
+
+        if [[ "$FILE_TYPE" == "vhd" ]]; then
+            unmount_vhd
+        else
+            unmount_image
+        fi
+
+        remove_link
+        ;;
+    *)
+        die "알 수 없는 동작: $ACTION"
+        ;;
+esac

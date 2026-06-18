@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+
+# ==============================================================================
+# Script Name: xclip_img
+# Description: Wayland 환경에서 복사한 이미지를 Xwayland(X11) 호환 앱에 
+#              정상적으로 붙여넣기 위해, 다양한 이미지 포맷을 범용적인 PNG로 
+#              변환하여 X11 클립보드에 Forwarding하는 유틸리티.
+# Author: Hyunjun Lee
+# Dependencies: wl-clipboard, xclip, imagemagick (magick or convert)
+# ==============================================================================
+
+
+
+set -euo pipefail
+
+tmp="$(mktemp --suffix=.png)"
+trap 'rm -f "$tmp"' EXIT
+
+im_convert() {
+  if command -v magick >/dev/null 2>&1; then
+    magick "$@"
+  else
+    convert "$@"
+  fi
+}
+
+type="$(
+  wl-paste -l 2>/dev/null \
+    | grep -E '^image/(png|bmp|jpeg|jpg|gif|webp)$' \
+    | head -n 1 || true
+)"
+
+if [ -z "$type" ]; then
+  echo "No image MIME type found in Wayland clipboard." >&2
+  exit 1
+fi
+
+case "$type" in
+  image/png)
+    wl-paste -t image/png > "$tmp"
+    ;;
+  image/bmp)
+    wl-paste -t image/bmp | im_convert bmp:- png:"$tmp"
+    ;;
+  image/jpeg|image/jpg)
+    wl-paste -t "$type" | im_convert jpg:- png:"$tmp"
+    ;;
+  image/gif)
+    wl-paste -t image/gif | im_convert gif:- png:"$tmp"
+    ;;
+  image/webp)
+    wl-paste -t image/webp | im_convert webp:- png:"$tmp"
+    ;;
+esac
+
+if [ ! -s "$tmp" ]; then
+  echo "PNG conversion failed: empty output." >&2
+  exit 2
+fi
+
+# 1) Wayland clipboard
+wl-copy -t image/png < "$tmp"
+
+wayland_ok=0
+if wl-paste -l 2>/dev/null | grep -qx 'image/png'; then
+  wayland_ok=1
+fi
+
+# 2) X11 clipboard. xclip must be last because it becomes the X11 clipboard owner.
+x11_ok=0
+if [ -n "${DISPLAY:-}" ] && [ -x /usr/bin/xclip ]; then
+  pkill -x xclip 2>/dev/null || true
+
+  /usr/bin/xclip -selection clipboard -t image/png -i "$tmp"
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if /usr/bin/xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -qx 'image/png'; then
+      x11_ok=1
+      break
+    fi
+    sleep 0.1
+  done
+fi
+
+if [ "$wayland_ok" = 1 ] && [ "$x11_ok" = 1 ]; then
+  echo "Published clipboard image as image/png to Wayland and X11."
+elif [ "$wayland_ok" = 1 ]; then
+  echo "Published clipboard image as image/png to Wayland, but X11/xclip did not advertise image/png." >&2
+  exit 3
+else
+  echo "Failed to publish image/png." >&2
+  exit 4
+fi

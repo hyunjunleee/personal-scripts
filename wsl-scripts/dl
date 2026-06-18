@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+
+# =============================================================================
+# Script Name: dl
+# Description: WSL 환경에서 윈도우 다운로드 폴더의 파일을 빠르고 안전하게 가져오는 유틸리티
+# Author: Hyunjun Lee
+# ==============================================================================
+
+
+n=1
+n_set=0
+dest="."
+wsl_dl="$HOME/downloads"
+allow_dir=0
+move_mode=0
+list_mode=0
+target_name=""  # 지정할 파일/디렉토리 이름 저장
+get_name=0      # 다음 인자가 파일명인지 확인하는 플래그
+
+# 1. 윈도우 사용자 이름 캐싱
+# Personal Use에서는 .bashrc로 초기 $WSL_WIN_USER_CACHE 설정해둠
+if [ -z "$WSL_WIN_USER_CACHE" ]; then
+    export WSL_WIN_USER_CACHE=$(cmd.exe /c echo %USERNAME% 2>/dev/null | tr -d '\r')
+    [ -z "$WSL_WIN_USER_CACHE" ] && export WSL_WIN_USER_CACHE="HOME"
+fi
+win_dl="/mnt/c/Users/$WSL_WIN_USER_CACHE/Downloads"
+
+
+for arg in "$@"; do
+    if [ "$get_name" -eq 1 ]; then
+        target_name="$arg"
+        get_name=0
+        continue
+    fi
+
+    case "$arg" in
+        -h|--help)
+            echo -e "\033[1;36m[사용법]\033[0m dl [숫자] [옵션]"
+            echo -e "\n\033[1;33m[옵션]\033[0m"
+            echo -e "  \033[1m-m, --move\033[0m    복사가 아닌 이동(mv) 수행"
+            echo -e "  \033[1m-g, --global\033[0m  WSL 다운로드 폴더(~/downloads)로 이동/복사"
+            echo -e "  \033[1m-d, --dir\033[0m     디렉토리도 포함"
+            echo -e "  \033[1m-l, --list\033[0m    윈도우 다운로드 폴더의 최신 항목 출력 (기본 5개)"
+            echo -e "  \033[1m-f, --file\033[0m    특정 이름의 파일이나 디렉토리를 지정해서 가져옴" 
+            echo -e "  \033[1m--clean\033[0m       다운로드 폴더 비우기 (파일마다 삭제 여부 확인)"
+            exit 0
+            ;;
+        -f|--file) get_name=1 ;; 
+        -g|--global) 
+            dest="$wsl_dl"
+            mkdir -p "$wsl_dl" 
+            ;;
+        -d|--dir) allow_dir=1 ;;
+        -m|--move) move_mode=1 ;;
+        -l|--list) list_mode=1 ;;
+        --clean)
+            echo "다운로드 폴더를 비우는 중... (파일마다 삭제 여부를 확인합니다)"
+            find "${wsl_dl:?}" -mindepth 1 -maxdepth 1 -exec rm -rvi {} +
+            echo "✅ 정리 작업이 완료되었습니다."
+            exit 0
+            ;;
+        *[0-9]*)
+            n="$arg"
+            n_set=1
+            ;;
+    esac
+done
+
+if [ ! -d "$win_dl" ]; then 
+    echo "❌ 오류: 윈도우 다운로드 경로를 찾을 수 없습니다! ($win_dl)"
+    exit 1
+fi
+
+# 3. 리스트 모드
+if [ "$list_mode" -eq 1 ]; then
+    [ "$n_set" -eq 0 ] && n=5
+    echo -e "🔍 \033[1;36m윈도우 다운로드 폴더 최신 항목 ${n}개\033[0m"
+    \ls -1tA "$win_dl" 2>/dev/null | grep -vE -i '\.(crdownload|part|tmp)$|^desktop\.ini$' | head -n "$n" | while read -r item; do
+        if [ -d "$win_dl/$item" ]; then
+            echo -e "  \033[1;34m📂 $item/\033[0m"
+        else
+            echo -e "  📄 $item"
+        fi
+    done
+    exit 0
+fi
+
+# 4. 진행 상황 출력
+dest_name="현재 위치(.)"
+[ "$dest" = "$wsl_dl" ] && dest_name="WSL 다운로드(~/downloads)"
+action_name="복사"
+[ "$move_mode" -eq 1 ] && action_name="이동"
+
+# 특정 파일을 지정했는지 여부에 따라 출력 문구 변경
+if [ -n "$target_name" ]; then
+    echo -e "📥 \033[1;36m[$target_name]\033[0m 항목을 \033[1;32m[${dest_name}]\033[0m(으)로 \033[1;31m${action_name}\033[0m합니다..."
+else
+    echo -e "📥 최신 \033[1;36m${n}개\033[0m 항목을 \033[1;32m[${dest_name}]\033[0m(으)로 \033[1;31m${action_name}\033[0m합니다..."
+fi
+
+# 5. 파일 목록 추출
+declare -a files
+if [ -n "$target_name" ]; then
+    files=("$target_name")
+else
+    if [ "$allow_dir" -eq 1 ]; then
+        mapfile -t files < <(\ls -1tA "$win_dl" 2>/dev/null | grep -vE -i '\.(crdownload|part|tmp)$|^desktop\.ini$' | head -n "$n")
+    else
+        mapfile -t files < <(\ls -1tAp "$win_dl" 2>/dev/null | grep -v '/$' | grep -vE -i '\.(crdownload|part|tmp)$|^desktop\.ini$' | head -n "$n")
+    fi
+fi
+
+if [ ${#files[@]} -eq 0 ]; then 
+    echo "⚠️ 알림: 가져올 항목이 없습니다."
+    exit 0
+fi
+
+# 6. 루프 실행
+for file in "${files[@]}"; do
+    src_path="$win_dl/$file"
+    if [ -e "$src_path" ]; then
+        if [ "$move_mode" -eq 1 ]; then
+            if mv "$src_path" "$dest/"; then
+                echo "✅ 이동 완료: $file"
+            else
+                echo "❌ 실패: 이동 중 에러 발생 ($file)"
+            fi
+        else
+            if cp -a -- "$src_path" "$dest/"; then
+                echo "✅ 복사 완료: $file"
+            else
+                echo "❌ 실패: 복사 중 에러 발생 ($file)"
+            fi
+        fi
+    else
+        echo "❌ 오류: 해당 파일 또는 디렉토리를 찾을 수 없습니다 ($file)"
+    fi
+done
+
+exit 0
